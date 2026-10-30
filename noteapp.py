@@ -114,6 +114,20 @@ def save_users(users_list):
 
 all_users = load_users()
 current_user = all_users[0]
+try:
+    _state_file = os.path.expanduser("~/.current_student_id")
+    if not os.path.exists(_state_file) and os.path.exists("/tmp/current_student_id"):
+        _state_file = "/tmp/current_student_id"
+    if os.path.exists(_state_file):
+        with open(_state_file, "r", encoding="utf-8") as _f:
+            _saved_id = _f.read().strip()
+        if _saved_id:
+            for _u in all_users:
+                if str(_u.get("id")) == _saved_id or str(_u.get("student_id")) == _saved_id or _u.get("name") == _saved_id:
+                    current_user = _u
+                    break
+except Exception as _e:
+    print(f"[USER RESTORE ERROR]: {_e}")
 
 def get_user_db_path(user_id):
     return os.path.expanduser(f"~/notes_{user_id}.db")
@@ -206,17 +220,33 @@ def call_gemini_assistant_api(img_bytes):
             print(f"[Gemini Assistant Error {model_name}]: {e}")
     return "Не успях да се свържа с Gemini. Проверете интернет връзката си."
 
-def call_gemini_beautify_page(img_bytes):
+def call_gemini_beautify_page(img_bytes, existing_context=""):
     from google.genai import types
     client = get_client()
 
     prompt = (
-        "Ти си интелигентен редактор на учебни записки за смарт тетрадка.\n"
-        "Оформи ръкописа в красив, структуриран и подреден конспект на български език (на кирилица).\n"
-        "БЕЗ LaTeX и БЕЗ знаци за долар ($)! Ползвай само Unicode символи: √, ², ³, ±, ×, /.\n"
-        "Върни СТРОГО чист JSON формат без кодови ограждения:\n"
-        '{"title": "Заглавие на урока", "items": [{"type": "header"|"text"|"math", "text": "...", "indent": 0}]}\n'
+        "Ти си интелигентен академичен редактор на учебни записки за смарт тетрадка.\n"
+        "Оформи новия ръкопис на чист български език (кирилица).\n"
     )
+    if existing_context.strip():
+        prompt += (
+            f"ВЕЧЕ СЪЩЕСТВУВА СЛЕДНИЯТ КОНСПЕКТ НА СТРАНИЦАТА:\n{existing_context}\n\n"
+            "ТВОЯТА ЗАДАЧА:\n"
+            "1. Анализирай дали новият ръкопис е логическо продължение/допълнение на съществуващия конспект.\n"
+            "2. АКО Е ПО СЪЩАТА ТЕМА: Върни ОБЕДИНЕН конспект под същото заглавие, като органично и логично вградиш новите дефиниции, точки или формули.\n"
+            "3. АКО Е НОВА ТЕМА ИЛИ РАЗЛИЧЕН ПРЕДМЕТ: Запази първия конспект непокътнат и добави НОВА секция със свое заглавие отдолу.\n"
+        )
+    else:
+        prompt += (
+            "Оформи ръкописа в подреден, логичен конспект с ясно заглавие.\n"
+        )
+
+    prompt += (
+        "СТРОГО БЕЗ LaTeX и БЕЗ знаци за долар ($)! Математическите символи пиши само с Unicode: √, ², ³, ±, ×, /.\n"
+        "Върни СТРОГО чист JSON обект без ограждащи форматиращи кавички или markdown кодови блокове:\n"
+        '{"sections": [{"title": "Заглавие", "items": [{"type": "header"|"text"|"math", "text": "...", "indent": 0}]}]}\n'
+    )
+
     image_part = types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
 
     for model_name in CANDIDATE_MODELS:
@@ -224,7 +254,7 @@ def call_gemini_beautify_page(img_bytes):
             resp = client.models.generate_content(
                 model=model_name,
                 contents=[image_part, prompt],
-                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=1200)
+                config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=1800)
             )
             if resp and resp.text:
                 raw = resp.text.strip()
@@ -233,8 +263,11 @@ def call_gemini_beautify_page(img_bytes):
                     raw = re.sub(r"\s*```$", "", raw)
                 try:
                     data = json.loads(raw)
-                    if isinstance(data, dict) and "items" in data:
-                        return data
+                    if isinstance(data, dict):
+                        if "sections" in data:
+                            return data["sections"]
+                        elif "items" in data:
+                            return [data]
                 except Exception:
                     pass
         except Exception as e:
@@ -250,13 +283,18 @@ def init_db(user_id):
         CREATE TABLE IF NOT EXISTS pages (
             page_num INTEGER PRIMARY KEY,
             ink_data BLOB,
+            plan_json TEXT DEFAULT '',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    try:
+        c.execute("ALTER TABLE pages ADD COLUMN plan_json TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
-def db_save_page(user_id, page_num, canvas_surf):
+def db_save_page(user_id, page_num, canvas_surf, plan_items=None):
     try:
         db_f = get_user_db_path(user_id)
         raw_png = pygame.image.tostring(canvas_surf, "RGBA")
@@ -265,15 +303,18 @@ def db_save_page(user_id, page_num, canvas_surf):
         pil_img.save(buf, format="PNG", optimize=False)
         ink_bytes = buf.getvalue()
 
+        plan_str = json.dumps(plan_items, ensure_ascii=False) if plan_items else ""
+
         conn = sqlite3.connect(db_f)
         c = conn.cursor()
         c.execute("""
-            INSERT INTO pages (page_num, ink_data, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO pages (page_num, ink_data, plan_json, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(page_num) DO UPDATE SET
                 ink_data = excluded.ink_data,
+                plan_json = CASE WHEN excluded.plan_json != '' THEN excluded.plan_json ELSE pages.plan_json END,
                 updated_at = CURRENT_TIMESTAMP
-        """, (page_num, ink_bytes))
+        """, (page_num, ink_bytes, plan_str))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -284,21 +325,32 @@ def db_load_page(user_id, page_num, canvas_w, canvas_h):
         db_f = get_user_db_path(user_id)
         conn = sqlite3.connect(db_f)
         c = conn.cursor()
-        c.execute("SELECT ink_data FROM pages WHERE page_num = ?", (page_num,))
-        row = c.fetchone()
+        try:
+            c.execute("SELECT ink_data, plan_json FROM pages WHERE page_num = ?", (page_num,))
+            row = c.fetchone()
+        except Exception:
+            c.execute("SELECT ink_data, '' FROM pages WHERE page_num = ?", (page_num,))
+            row = c.fetchone()
         conn.close()
+
+        plan_items = []
+        if row and len(row) > 1 and row[1]:
+            try:
+                plan_items = json.loads(row[1])
+            except Exception:
+                plan_items = []
 
         if row and row[0]:
             surf = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
             buf = io.BytesIO(row[0])
             pil_img = Image.open(buf)
-            data = pil_img.tobytes()
-            loaded_surf = pygame.image.fromstring(data, pil_img.size, pil_img.mode).convert_alpha()
-            surf.blit(loaded_surf, (0, 0))
-            return surf
+            raw = pil_img.tobytes("raw", "RGBA")
+            s = pygame.image.fromstring(raw, pil_img.size, "RGBA")
+            surf.blit(s, (0, 0))
+            return surf, plan_items
     except Exception as e:
         print(f"Грешка четене: {e}")
-    return None
+    return None, []
 
 def db_get_all_page_nums(user_id):
     try:
@@ -336,7 +388,6 @@ pygame.init()
 # ----------------- ЕКРАН И ДИЗАЙН -----------------
 screen_w, screen_h = 1920, 1080
 screen = pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE, 32)
-print(f"[DISPLAY] Активиран кристален Full HD режим: {screen_w}x{screen_h} 32-bit True Color")
 pygame.display.set_caption("Смарт Тетрадка")
 pygame.mouse.set_visible(True)
 
@@ -458,9 +509,8 @@ def get_crisp_icon(name, color_rgba, size=20):
     ICONS_CACHE[key] = surf
     return surf
 
-# ----------------- НЕПРЕКЪСНАТ ЗАОБЛЕН DOCK С КОСИНУСОВА ПОЛУДАГА -----------------
+# ----------------- DOCK КЕШИРАНЕ -----------------
 dock_surface_cache = {}
-
 base_dock_cache = {}
 hole_cutter_surf = None
 
@@ -522,7 +572,6 @@ def render_smooth_dock_curve(w, h, ibx, pad=14, notch_w=76, notch_d=24, radius=2
     cut_x = int(pad + ibx - 27)
     cut_y = int(pad - 7 - 27)
 
-    # Моментално изрязване без CPU забавяне
     dock_surf.blit(cutter, (cut_x, cut_y), special_flags=pygame.BLEND_RGBA_SUB)
     return dock_surf
 
@@ -538,14 +587,12 @@ def get_crisp_bubble(size=48):
     canvas_s = size * scale + pad * 2
     img = Image.new("RGBA", (canvas_s, canvas_s), (0, 0, 0, 0))
 
-    # Мека сянка
     shadow = Image.new("RGBA", (canvas_s, canvas_s), (0, 0, 0, 0))
     s_draw = ImageDraw.Draw(shadow)
     s_box = [pad, pad + 2 * scale, canvas_s - pad, canvas_s - pad + 2 * scale]
     s_draw.ellipse(s_box, fill=(0, 0, 0, 100))
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=2 * scale))
 
-    # Самото кръгче с по-плътно и отчетливо очертание (2.2px)
     circle = Image.new("RGBA", (canvas_s, canvas_s), (0, 0, 0, 0))
     c_draw = ImageDraw.Draw(circle)
     c_box = [pad, pad, canvas_s - pad, canvas_s - pad]
@@ -569,14 +616,12 @@ def get_crisp_modal_card(w, h, radius=20, border_color=(226, 232, 240, 255), fil
     sw, sh = pw * scale, ph * scale
     spad = pad * scale
 
-    # Сянка
     shadow = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
     s_draw = ImageDraw.Draw(shadow)
     s_box = [spad, spad + int(4 * scale), spad + w * scale, spad + (h + 4) * scale]
     s_draw.rounded_rectangle(s_box, radius=radius * scale, fill=(15, 23, 42, 60))
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=3.5 * scale))
 
-    # Карта с контур
     card = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
     c_draw = ImageDraw.Draw(card)
     c_box = [spad, spad, spad + w * scale, spad + h * scale]
@@ -607,6 +652,9 @@ def generate_dot_grid():
 
 PAGE_BACKGROUND = generate_dot_grid()
 
+STATIC_OVERLAY = pygame.Surface((1920, 1080), pygame.SRCALPHA)
+STATIC_OVERLAY.fill((15, 23, 42, 140))
+
 class Page:
     __slots__ = ['canvas', 'history', 'ink_bounds', 'has_ink', 'has_unprocessed_ink', 'content_bottom_y', 'formatted_items']
     def __init__(self, user_id=None, page_num=None, canvas_surf=None):
@@ -614,22 +662,26 @@ class Page:
             self.canvas = canvas_surf
             self.has_ink = True
         elif user_id and page_num is not None:
-            loaded_surf = db_load_page(user_id, page_num, CANVAS_W, CANVAS_H)
+            res = db_load_page(user_id, page_num, CANVAS_W, CANVAS_H)
+            if isinstance(res, tuple):
+                loaded_surf, loaded_plan = res
+            else:
+                loaded_surf, loaded_plan = res, []
+
             if loaded_surf:
                 self.canvas = loaded_surf
                 self.has_ink = True
             else:
                 self.canvas = pygame.Surface((CANVAS_W, CANVAS_H), pygame.SRCALPHA)
                 self.has_ink = False
-        else:
-            self.canvas = pygame.Surface((CANVAS_W, CANVAS_H), pygame.SRCALPHA)
-            self.has_ink = False
+            self.formatted_items = loaded_plan if loaded_plan else []
 
         self.has_unprocessed_ink = False
         self.history = [self.canvas.copy()]
         self.ink_bounds = [CANVAS_W, CANVAS_H, 0, 0]
         self.content_bottom_y = 100
-        self.formatted_items = []
+        if not hasattr(self, 'formatted_items'):
+            self.formatted_items = []
 
     def track_point(self, x, y):
         self.has_ink = True
@@ -662,11 +714,96 @@ drawer_drag_start_y = 0
 is_analyzing = False
 ai_analysis_text = ""
 
-# PDF Export & QR
+# PDF Export & QR предварително кеширани
 show_pdf_modal = False
-pdf_qr_surf = None
-pdf_download_url = ""
 http_server_running = False
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+CACHED_LOCAL_IP = get_local_ip()
+pdf_download_url = f"http://{CACHED_LOCAL_IP}:8080/notes.pdf"
+
+class PDFDownloadHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        pdf_file = os.path.expanduser("~/notes.pdf")
+        if os.path.exists(pdf_file):
+            with open(pdf_file, 'rb') as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/pdf')
+            self.send_header('Content-Disposition', 'attachment; filename="notes.pdf"')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.send_error(404, "File not found")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_pdf_server():
+    global http_server_running
+    if http_server_running:
+        return
+    ip = CACHED_LOCAL_IP
+    port = 8080
+    try:
+        server = HTTPServer((ip, port), PDFDownloadHandler)
+        http_server_running = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    except Exception as e:
+        print(f"[PDF Server error]: {e}")
+
+start_pdf_server()
+
+if HAS_QR:
+    try:
+        _qr = qrcode.QRCode(box_size=6, border=2)
+        _qr.add_data(pdf_download_url)
+        _qr.make(fit=True)
+        _qr_pil = _qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        pdf_qr_surf = pygame.image.fromstring(_qr_pil.tobytes(), _qr_pil.size, "RGB")
+    except Exception:
+        pdf_qr_surf = None
+else:
+    pdf_qr_surf = None
+
+def export_all_to_pdf_and_show_qr():
+    global show_pdf_modal
+    show_pdf_modal = True
+
+    def _worker():
+        try:
+            save_current_page()
+            pil_pages = []
+            for p in list(pages):
+                time.sleep(0.01)
+                raw_bg = pygame.image.tostring(PAGE_BACKGROUND, "RGB")
+                raw_ink = pygame.image.tostring(p.canvas, "RGBA")
+
+                bg_img = Image.frombytes("RGB", (CANVAS_W, CANVAS_H), raw_bg)
+                ink_img = Image.frombytes("RGBA", (CANVAS_W, CANVAS_H), raw_ink)
+
+                bg_img.paste(ink_img, (0, 0), ink_img)
+                downscaled = bg_img.resize((1920, 1200), Image.Resampling.BILINEAR)
+                pil_pages.append(downscaled)
+
+            pdf_path = os.path.expanduser("~/notes.pdf")
+            if pil_pages:
+                pil_pages[0].save(pdf_path, "PDF", resolution=96.0, save_all=True, append_images=pil_pages[1:])
+        except Exception as e:
+            print(f"[PDF Export Error]: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 # Модали за потребители
 show_user_modal = False
@@ -686,7 +823,25 @@ book_page_surf = None
 def get_textbook_files():
     if not os.path.exists(TEXTBOOKS_DIR):
         return []
-    return sorted([f for f in os.listdir(TEXTBOOKS_DIR) if f.lower().endswith(".pdf")])
+    all_pdfs = [f for f in os.listdir(TEXTBOOKS_DIR) if f.lower().endswith(".pdf")]
+
+    # Взимаме класа на текущия ученик
+    u_grade = ""
+    if "current_user" in globals() and isinstance(current_user, dict):
+        u_grade = str(current_user.get("grade", "")).strip().upper()
+
+    meta_path = os.path.join(TEXTBOOKS_DIR, "metadata.json")
+    if os.path.exists(meta_path) and u_grade:
+        try:
+            import json
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                meta = json.load(mf)
+            # Филтрираме само тези, които съвпадат по клас
+            filtered = [f for f in all_pdfs if meta.get(f, {}).get("grade", "").strip().upper() == u_grade]
+            return sorted(filtered)
+        except Exception:
+            pass
+    return sorted(all_pdfs)
 
 def open_textbook(filename):
     global current_book_doc, current_book_filename, book_page_idx, show_split_book, show_textbook_picker
@@ -782,36 +937,6 @@ def get_effective_tool():
         return "eraser"
     return active_tool
 
-def draw_smooth_pen(surf, p1, p2, color, stroke_w):
-    p1_i = (int(p1[0]), int(p1[1]))
-    p2_i = (int(p2[0]), int(p2[1]))
-    r = max(2, stroke_w // 2)
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    dist = math.hypot(dx, dy)
-    if dist < 1.0:
-        pygame.draw.circle(surf, color, p2_i, r)
-        return
-    pygame.draw.line(surf, color, p1_i, p2_i, stroke_w)
-    pygame.draw.circle(surf, color, p1_i, r)
-    pygame.draw.circle(surf, color, p2_i, r)
-
-def erase_smooth(surf, p1, p2, radius=26):
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    dist = int(math.hypot(dx, dy))
-    clear_c = (0, 0, 0, 0)
-    p2_i = (int(p2[0]), int(p2[1]))
-    if dist < 2:
-        pygame.draw.circle(surf, clear_c, p2_i, radius)
-        return
-    step = max(2, radius // 2)
-    for i in range(0, dist + 1, step):
-        t = i / max(1, dist)
-        x = int(p1[0] + dx * t)
-        y = int(p1[1] + dy * t)
-        pygame.draw.circle(surf, clear_c, (x, y), radius)
-
 def push_undo():
     p = pages[curr_idx]
     if len(p.history) >= 15:
@@ -832,11 +957,26 @@ def clear_current_page():
     p.has_ink = False
     p.has_unprocessed_ink = False
     p.ink_bounds = [CANVAS_W, CANVAS_H, 0, 0]
+    p.formatted_items = []
+    p.content_bottom_y = 100
     save_current_page()
+
+def delete_current_page():
+    global curr_idx, pages, offset_x, offset_y
+    if len(pages) > 1:
+        pages.pop(curr_idx)
+        if curr_idx >= len(pages):
+            curr_idx = len(pages) - 1
+        offset_x, offset_y = 0, 0
+        threading.Thread(target=lambda: db_resave_all_pages(current_user["id"], pages), daemon=True).start()
+        show_toast("Страницата е изтрита")
+    else:
+        clear_current_page()
+        show_toast("Страницата е изчистена")
 
 def save_current_page():
     p = pages[curr_idx]
-    db_save_page(current_user["id"], curr_idx + 1, p.canvas)
+    db_save_page(current_user["id"], curr_idx + 1, p.canvas, getattr(p, 'formatted_items', []))
 
 def next_page():
     global curr_idx, offset_x, offset_y
@@ -885,7 +1025,6 @@ def trigger_gemini_analysis():
         show_ai_drawer = True
         return
 
-    # Проверка дали на листа има мастило, оформен текст или пиксели
     bbox = source_p.canvas.get_bounding_rect()
     has_content = (
         source_p.has_ink or
@@ -908,7 +1047,6 @@ def trigger_gemini_analysis():
     def _worker():
         global is_analyzing, ai_analysis_text
         try:
-            # Определяме границите на съдържанието за анализ
             min_x, min_y, max_x, max_y = source_p.ink_bounds
             if max_x < min_x or max_y < min_y:
                 if bbox.w > 10 and bbox.h > 10:
@@ -952,7 +1090,6 @@ def trigger_beautify_to_new_page():
     if is_beautifying:
         return
 
-    # Проверяваме за реален, непреработен ръкопис
     if not getattr(source_p, "has_unprocessed_ink", False):
         show_toast("Листът няма нов ръкопис за оформяне!")
         return
@@ -989,38 +1126,44 @@ def trigger_beautify_to_new_page():
             pil_img.save(buf, format="JPEG", quality=85)
             img_bytes = buf.getvalue()
 
-            data = call_gemini_beautify_page(img_bytes)
+            existing_ctx = ""
+            if hasattr(source_p, "formatted_items") and source_p.formatted_items:
+                for sec in source_p.formatted_items:
+                    existing_ctx += f"Тема: {sec.get('title', '')}\n"
+                    for item in sec.get("items", []):
+                        existing_ctx += f" - {item.get('text', '')}\n"
 
-            if data and "items" in data and len(data["items"]) > 0:
+            print('[DEBUG BEAUTIFY] Дължина на existing_ctx:', len(existing_ctx))
+            if existing_ctx:
+                print('[DEBUG BEAUTIFY] Контекст:', repr(existing_ctx[:120]))
+            else:
+                print('[DEBUG BEAUTIFY] ВНИМАНИЕ: Няма подаден съществуващ контекст!')
+            sections = call_gemini_beautify_page(img_bytes, existing_context=existing_ctx)
+            print('[DEBUG BEAUTIFY] Върнати секции:', len(sections) if sections else 0)
+
+            if sections and isinstance(sections, list):
                 push_undo()
                 target_p = source_p
-
-                # Задаваме чист списък за тази страница без натрупване и дублиране
-                if not hasattr(target_p, "formatted_items") or target_p.formatted_items is None:
-                    target_p.formatted_items = []
-                target_p.formatted_items = [data]
-
-                # ИЗТРИВАМЕ ЦЕЛИЯ РЪКОПИС (чистим драсканиците от платното)
+                target_p.formatted_items = sections
                 target_p.canvas.fill((0, 0, 0, 0))
 
-                # Начертаваме на чисто всички съхранени оформени уроци
                 cur_y = 100
                 base_x = 90
 
-                for block_idx, block in enumerate(target_p.formatted_items):
-                    b_title = block.get("title", "")
-                    if b_title:
-                        if block_idx > 0:
-                            cur_y += 20
-                            pygame.draw.line(target_p.canvas, (226, 232, 240), (base_x, cur_y), (base_x + 900, cur_y), 2)
-                            cur_y += 25
-                        t_surf = font_title.render(b_title, True, C_BLUE_ACCENT)
+                for s_idx, sec in enumerate(target_p.formatted_items):
+                    s_title = sec.get("title", "").strip()
+                    if s_title:
+                        if s_idx > 0:
+                            cur_y += 30
+                            pygame.draw.line(target_p.canvas, (203, 213, 225), (base_x, cur_y), (base_x + 920, cur_y), 2)
+                            cur_y += 35
+                        t_surf = font_title.render(s_title, True, C_BLUE_ACCENT)
                         target_p.canvas.blit(t_surf, (base_x, cur_y))
                         cur_y += t_surf.get_height() + 10
-                        pygame.draw.line(target_p.canvas, (219, 234, 254), (base_x, cur_y), (base_x + 600, cur_y), 3)
-                        cur_y += 35
+                        pygame.draw.line(target_p.canvas, (219, 234, 254), (base_x, cur_y), (base_x + 550, cur_y), 3)
+                        cur_y += 32
 
-                    for item in block.get("items", []):
+                    for item in sec.get("items", []):
                         i_type = item.get("type", "text")
                         txt = item.get("text", "").strip()
                         if not txt:
@@ -1029,7 +1172,7 @@ def trigger_beautify_to_new_page():
                         item_x = base_x + indent * 36
 
                         if i_type == "header":
-                            cur_y += 14
+                            cur_y += 16
                             h_surf = font_head.render(txt, True, (30, 41, 59))
                             target_p.canvas.blit(h_surf, (item_x, cur_y))
                             cur_y += 38
@@ -1046,19 +1189,17 @@ def trigger_beautify_to_new_page():
                                 target_p.canvas.blit(b_surf, (item_x, cur_y))
                                 cur_y += 30
 
-                target_p.content_bottom_y = cur_y + 20
-                # Нулираме мастилото - чакаме следващ ръкопис
+                target_p.content_bottom_y = cur_y + 30
                 target_p.has_ink = False
                 target_p.has_unprocessed_ink = False
                 target_p.ink_bounds = [CANVAS_W, CANVAS_H, 0, 0]
                 save_current_page()
-                print(f"[BEAUTIFY] Ръкописът е изчистен! Поставен е само чистият текст. Следваща линия: Y={target_p.content_bottom_y}")
+                print(f"[BEAUTIFY] Готово! Натрупани {len(target_p.formatted_items)} секции.")
         except Exception as e:
             print(f"[Beautify error]: {e}")
             show_toast(f"Грешка: {e}")
         finally:
             is_beautifying = False
-            print("[BEAUTIFY] Процесът приключи.")
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -1072,6 +1213,14 @@ def switch_user(user_obj):
 
     save_current_page()
     current_user = user_obj
+    try:
+        _u_val = str(current_user.get("id") or current_user.get("name", ""))
+        with open(os.path.expanduser("~/.current_student_id"), "w", encoding="utf-8") as _sf:
+            _sf.write(_u_val)
+        with open("/tmp/current_student_id", "w", encoding="utf-8") as _sf:
+            _sf.write(_u_val)
+    except Exception as _e:
+        print(f"[USER SAVE ERROR]: {_e}")
     pages = load_user_pages(current_user["id"])
     curr_idx = 0
     offset_x, offset_y = 0, 0
@@ -1095,90 +1244,11 @@ def submit_new_user():
     save_users(all_users)
     switch_user(new_u)
 
-# ----------------- PDF УЕБ СЪРВЪР -----------------
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = '127.0.0.1'
-    finally:
-        s.close()
-    return ip
-
-class PDFDownloadHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        pdf_file = os.path.expanduser("~/notes.pdf")
-        if os.path.exists(pdf_file):
-            with open(pdf_file, 'rb') as f:
-                data = f.read()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/pdf')
-            self.send_header('Content-Disposition', 'attachment; filename="notes.pdf"')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        else:
-            self.send_error(404, "File not found")
-
-    def log_message(self, format, *args):
-        pass
-
-def start_pdf_server():
-    global http_server_running
-    if http_server_running:
-        return
-    ip = get_local_ip()
-    port = 8080
-    try:
-        server = HTTPServer((ip, port), PDFDownloadHandler)
-        http_server_running = True
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-    except Exception as e:
-        print(f"[PDF Server error]: {e}")
-
-def export_all_to_pdf_and_show_qr():
-    global show_pdf_modal, pdf_qr_surf, pdf_download_url
-    save_current_page()
-
-    pil_pages = []
-    for p in pages:
-        full_surf = pygame.Surface((CANVAS_W, CANVAS_H), depth=24)
-        full_surf.blit(PAGE_BACKGROUND, (0, 0))
-        full_surf.blit(p.canvas, (0, 0))
-        raw = pygame.image.tostring(full_surf, "RGB")
-        img = Image.frombytes("RGB", (CANVAS_W, CANVAS_H), raw)
-        pil_pages.append(img)
-
-    pdf_path = os.path.expanduser("~/notes.pdf")
-    if pil_pages:
-        pil_pages[0].save(pdf_path, "PDF", resolution=100.0, save_all=True, append_images=pil_pages[1:])
-
-    start_pdf_server()
-    ip = get_local_ip()
-    pdf_download_url = f"http://{ip}:8080/notes.pdf"
-
-    if HAS_QR:
-        qr = qrcode.QRCode(box_size=6, border=2)
-        qr.add_data(pdf_download_url)
-        qr.make(fit=True)
-        qr_pil = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-        raw_qr = qr_pil.tobytes()
-        pdf_qr_surf = pygame.image.fromstring(raw_qr, qr_pil.size, "RGB")
-    else:
-        pdf_qr_surf = None
-
-    show_pdf_modal = True
-
 # ----------------- EVDEV DRIVER (WACOM PEN & BUTTONS) -----------------
 def start_wacom_thread():
     if not HAS_EVDEV:
         return
 
-    import select
-
-    # Търсим конкретно Pen устройството за координати и бутони 331/332
     pen_dev = None
     pad_dev = None
 
@@ -1229,7 +1299,6 @@ def start_wacom_thread():
                 for fd in r:
                     dev = dev_map[fd]
                     for ev in dev.read():
-                        # 1. КООРДИНАТИ И НАТИСК
                         if ev.type == evdev.ecodes.EV_ABS:
                             if ev.code == evdev.ecodes.ABS_X:
                                 cur_x = ev.value
@@ -1238,39 +1307,32 @@ def start_wacom_thread():
                             elif ev.code == evdev.ecodes.ABS_PRESSURE:
                                 current_pressure = max(0.0, min(1.0, ev.value / max(1, max_p)))
 
-                        # 2. БУТОНИ
                         elif ev.type == evdev.ecodes.EV_KEY:
                             sw, sh = screen.get_size()
                             sx = int((cur_x - min_x) / max(1, (max_x - min_x)) * sw)
                             sy = int((cur_y - min_y) / max(1, (max_y - min_y)) * sh)
                             pos = (max(0, min(sw - 1, sx)), max(0, min(sh - 1, sy)))
 
-                            # Долен бутон на писалката (331): Гумичка
                             if ev.code in (evdev.ecodes.BTN_STYLUS, 331):
                                 btn_eraser_down = (ev.value == 1)
                                 is_holding_eraser = btn_eraser_down
-                                # Ако е натиснат и вече докосваме, пращаме MOUSEBUTTONDOWN за гумичка (десен бутон 3)
                                 if is_touching:
                                     b = 3 if btn_eraser_down else 1
                                     pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, {'pos': pos, 'button': b}))
 
-                            # Горен бутон на писалката (332): Ръчичка (Pan)
                             elif ev.code in (evdev.ecodes.BTN_STYLUS2, 332):
                                 btn_pan_down = (ev.value == 1)
                                 is_holding_pan = btn_pan_down
                                 if not btn_pan_down:
                                     last_motion_pos = None
 
-                            # Връх на писалката (Докосване)
                             elif ev.code in (evdev.ecodes.BTN_TOUCH, 330):
                                 is_touching = (ev.value == 1)
-                                # Ако държим бутона за местене, НЕ пращаме кликове за писане/триене
                                 if not btn_pan_down:
                                     target_btn = 3 if btn_eraser_down else 1
                                     t = pygame.MOUSEBUTTONDOWN if is_touching else pygame.MOUSEBUTTONUP
                                     pygame.event.post(pygame.event.Event(t, {'pos': pos, 'button': target_btn}))
 
-                            # 4-те бутона на самия таблет (Pad)
                             elif ev.value == 1:
                                 if ev.code in (evdev.ecodes.BTN_0, 256, 273):
                                     pygame.event.post(pygame.event.Event(pygame.KEYDOWN, {'key': pygame.K_LEFT}))
@@ -1281,14 +1343,12 @@ def start_wacom_thread():
                                 elif ev.code in (evdev.ecodes.BTN_3, 259, 278):
                                     pygame.event.post(pygame.event.Event(pygame.KEYDOWN, {'key': pygame.K_n}))
 
-                        # 3. СИНХРОНИЗАЦИЯ НА ДВИЖЕНИЕТО
                         elif ev.type == evdev.ecodes.EV_SYN and ev.code == evdev.ecodes.SYN_REPORT:
                             sw, sh = screen.get_size()
                             sx = int((cur_x - min_x) / max(1, (max_x - min_x)) * sw)
                             sy = int((cur_y - min_y) / max(1, (max_y - min_y)) * sh)
                             pos = (max(0, min(sw - 1, sx)), max(0, min(sh - 1, sy)))
 
-                            # Ако държим горния бутон (332) -> ПЛАВНО МЕСТЕНЕ С ГРАНИЦИ (CLAMP)
                             if btn_pan_down:
                                 if last_motion_pos is not None:
                                     dx = pos[0] - last_motion_pos[0]
@@ -1315,23 +1375,115 @@ def start_wacom_thread():
 
 start_wacom_thread()
 
-# ----------------- ХАРДУЕРНИ БУТОНИ (GPIO 17, 26, 22, 16) -----------------
+# ----------------- TCP СЛУШАТЕЛ ЗА УЧИТЕЛСКО БЮРО (PORT 5005) -----------------
+def start_remote_control_listener():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server_socket.bind(('0.0.0.0', 5005))
+        server_socket.listen(5)
+        print("[REMOTE] Слушане за команди от учителско бюро на порт 5005...")
+    except Exception as e:
+        print(f"[REMOTE] Грешка при стартиране на порт 5005: {e}")
+        return
+
+    def _listen_loop():
+        while True:
+            try:
+                client_sock, _ = server_socket.accept()
+                data = client_sock.recv(4096)
+                if not data:
+                    client_sock.close()
+                    continue
+
+                payload = json.loads(data.decode('utf-8'))
+                print(f"[REMOTE] Получена команда: {payload}")
+
+                action = payload.get("action")
+                if action == "login":
+                    user_data = payload.get("student", {})
+                    u_id = user_data.get("id") or user_data.get("name", "student").lower()
+                    u_name = user_data.get("name", "Ученик")
+                    u_grade = user_data.get("grade", "10А")
+                    google_email = user_data.get("email", "")
+
+                    target_user = None
+                    for u in all_users:
+                        if u.get("id") == u_id or u.get("name") == u_name:
+                            target_user = u
+                            break
+
+                    if not target_user:
+                        target_user = {"id": u_id, "name": u_name, "grade": u_grade}
+                        all_users.append(target_user)
+                        save_users(all_users)
+
+                    switch_user(target_user)
+
+                    if google_email:
+                        classroom_url = f"[https://classroom.google.com/u/?authuser=](https://classroom.google.com/u/?authuser=){google_email}"
+                    else:
+                        classroom_url = "[https://classroom.google.com](https://classroom.google.com)"
+
+                    subprocess.Popen([
+                        "chromium-browser",
+                        "--no-first-run",
+                        "--disable-restore-session-state",
+                        classroom_url
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                client_sock.sendall(b'{"status": "ok"}')
+                client_sock.close()
+            except Exception as e:
+                print(f"[REMOTE ERROR]: {e}")
+                time.sleep(0.5)
+
+    threading.Thread(target=_listen_loop, daemon=True).start()
+
+start_remote_control_listener()
+
+# ----------------- ХАРДУЕРНИ БУТОНИ -----------------
 EVENT_BTN_NOTES     = pygame.USEREVENT + 10
 EVENT_BTN_CLASSROOM = pygame.USEREVENT + 11
 EVENT_BTN_BOOK      = pygame.USEREVENT + 12
 EVENT_BTN_AI        = pygame.USEREVENT + 13
 
-classroom_process = None
 classroom_proc = None
-is_in_classroom = False
 
 def open_classroom():
-    print("[HW] Бутон 2: Запазване и преминаване към Classroom...")
+    print("[HW] Бутон 2: Запазване и превключване към Classroom...")
     try:
         if "save_current_page" in globals():
             save_current_page()
-    except Exception:
-        pass
+
+        u = globals().get("current_user", {})
+        if not isinstance(u, dict):
+            u = {}
+
+        user_id = u.get("id") or u.get("student_id") or u.get("name") or "guest"
+        user_email = (
+            u.get("email") or
+            u.get("google_email") or
+            u.get("student_email") or
+            u.get("mail") or
+            ""
+        )
+
+        # Ако имейлът все още е празен, опитваме да го намерим от глобалните променливи
+        if not user_email:
+            for k in ["current_email", "student_email", "STUDENT_EMAIL"]:
+                if k in globals() and globals()[k]:
+                    user_email = str(globals()[k])
+                    break
+
+        with open("/tmp/current_student_id", "w", encoding="utf-8") as f:
+            f.write(str(user_id).strip())
+        with open("/tmp/current_student_email", "w", encoding="utf-8") as f:
+            f.write(str(user_email).strip())
+
+        print(f"[CLASSROOM SYNC] ID: {user_id} | Email: {user_email}")
+    except Exception as e:
+        print(f"[SAVE ERROR]: {e}")
     os._exit(42)
 
 def close_classroom():
@@ -1344,15 +1496,9 @@ if HAS_GPIO:
         btn_hw_book  = HWButton(22, pull_up=True, bounce_time=0.08)
         btn_hw_ai    = HWButton(16, pull_up=True, bounce_time=0.08)
 
-        def _on_btn1():
-            close_classroom()
-
-        def _on_btn2():
-            open_classroom()
-
-        btn_hw_notes.when_pressed = _on_btn1
-        btn_hw_class.when_pressed = _on_btn2
-        btn_hw_book.when_pressed = toggle_hw_book
+        btn_hw_notes.when_pressed = close_classroom
+        btn_hw_class.when_pressed = open_classroom
+        btn_hw_book.when_pressed  = toggle_hw_book
         btn_hw_ai.when_pressed    = lambda: pygame.event.post(pygame.event.Event(EVENT_BTN_AI))
         print("[HW BUTTONS] Готови на GPIO 17, 26, 22, 16")
     except Exception as e:
@@ -1361,7 +1507,39 @@ if HAS_GPIO:
 clock = pygame.time.Clock()
 start_app_time = time.time()
 
+_last_session_check = 0
 while True:
+    # Автоматично засичане на нова карта от уеб дашборда
+    if time.time() - _last_session_check > 0.4:
+        _last_session_check = time.time()
+        try:
+            _sess_file = "/tmp/current_student_id"
+            if os.path.exists(_sess_file):
+                with open(_sess_file, "r", encoding="utf-8") as _sf:
+                    _remote_id = _sf.read().strip()
+                if _remote_id and "current_user" in globals() and current_user.get("id") != _remote_id:
+                    # Търсим съвпадащ потребител или зареждаме от users.json
+                    all_users = load_users()
+                    target_u = next((u for u in all_users if u.get("id") == _remote_id), None)
+                    if not target_u:
+                        # Ако не съществува в users.json, взимаме данните от current_session.json
+                        if os.path.exists("/home/bobo/current_session.json"):
+                            import json
+                            with open("/home/bobo/current_session.json", "r", encoding="utf-8") as _csf:
+                                _cdata = json.load(_csf)
+                            target_u = {
+                                "id": _remote_id,
+                                "name": _cdata.get("name", _remote_id),
+                                "grade": _cdata.get("grade", "10Г"),
+                                "email": _cdata.get("email", "")
+                            }
+                            all_users.append(target_u)
+                            save_users(all_users)
+                    if target_u:
+                        switch_user(target_u)
+        except Exception as _e:
+            pass
+
     if globals().get("is_in_classroom", False):
         time.sleep(0.1)
         continue
@@ -1393,10 +1571,8 @@ while True:
     bar_h = 58
     bar_rect = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
 
-    # 1. Профил
     r_user = pygame.Rect(bar_x + 10, bar_y + 9, 96, 40)
 
-    # 2. 4 Цвята + Изчисти
     color_rects = []
     c_start_x = bar_x + 120
     for i in range(4):
@@ -1405,11 +1581,12 @@ while True:
 
     sep1_x = bar_x + 252
 
-    # 3. Страници
-    r_prev = pygame.Rect(sep1_x + 8, bar_y + 11, 26, 36)
-    r_pill = pygame.Rect(sep1_x + 36, bar_y + 11, 70, 36)
-    r_next = pygame.Rect(sep1_x + 108, bar_y + 11, 26, 36)
-    r_add  = pygame.Rect(sep1_x + 136, bar_y + 11, 28, 36)
+    r_del  = pygame.Rect(sep1_x + 6, bar_y + 11, 24, 36)
+    r_prev = pygame.Rect(sep1_x + 30, bar_y + 11, 24, 36)
+    r_pill = pygame.Rect(sep1_x + 56, bar_y + 11, 62, 36)
+    r_next = pygame.Rect(sep1_x + 120, bar_y + 11, 24, 36)
+    r_add  = pygame.Rect(sep1_x + 144, bar_y + 11, 24, 36)
+    globals()["g_r_del"]  = r_del
     globals()["g_r_prev"] = r_prev
     globals()["g_r_next"] = r_next
     globals()["g_r_add"]  = r_add
@@ -1417,7 +1594,6 @@ while True:
 
     sep2_x = sep1_x + 172
 
-    # 4. Основни табове
     r_tab_notes    = pygame.Rect(sep2_x + 8,   bar_y + 6, 66, 46)
     r_tab_book     = pygame.Rect(sep2_x + 86,  bar_y + 6, 68, 46)
     r_tab_pdf      = pygame.Rect(sep2_x + 162, bar_y + 6, 56, 46)
@@ -1438,6 +1614,9 @@ while True:
     elif show_split_book:
         target_bubble_cx = r_tab_book.centerx
         active_tab_name = "book"
+    elif show_pdf_modal:
+        target_bubble_cx = r_tab_pdf.centerx
+        active_tab_name = "pdf"
     else:
         target_bubble_cx = r_tab_notes.centerx
         active_tab_name = "notes"
@@ -1447,7 +1626,6 @@ while True:
     else:
         anim_bubble_x += (target_bubble_cx - anim_bubble_x) * 0.24
 
-    # Контроли на учебника
     r_book_prev  = pygame.Rect(12, 10, 34, 34)
     r_book_pill  = pygame.Rect(50, 10, 100, 34)
     r_book_next  = pygame.Rect(154, 10, 34, 34)
@@ -1455,8 +1633,7 @@ while True:
 
     btn_close_ai = pygame.Rect(sw - 38, 16, 26, 26)
 
-    # Модали
-    modal_w, modal_h = 420, 440
+    modal_w, modal_h = 460, 420
     modal_x = (sw - modal_w) // 2
     modal_y = (sh - modal_h) // 2
     modal_rect = pygame.Rect(modal_x, modal_y, modal_w, modal_h)
@@ -1509,7 +1686,6 @@ while True:
             pygame.quit()
             sys.exit()
 
-        # ==================== ХАРДУЕРНИ БУТОНИ ====================
         elif event.type == EVENT_BTN_NOTES:
             print("[BTN] Бутон 1: Връщане към активна тетрадка")
             if show_split_book:
@@ -1563,22 +1739,18 @@ while True:
             last_pos = curr_pos
             last_canvas_pt = curr_pos
 
-            # ================= ПРИОРИТЕТНО: ВСИЧКИ ХИКСЧЕТА И МОДАЛИ =================
             if event.button == 1:
-                # 1. Затваряне на Gemini / AI панел
                 if globals().get("show_ai_drawer"):
                     b_c_ai = globals().get("g_btn_close_ai")
                     if b_c_ai and b_c_ai.inflate(14, 14).collidepoint(curr_pos):
                         globals()["show_ai_drawer"] = False
                         is_drawing = False
                         continue
-                    # Затваряне при клик в горния десен ъгъл на чекмеджето
                     if curr_pos[0] >= screen.get_width() - 50 and curr_pos[1] <= 55:
                         globals()["show_ai_drawer"] = False
                         is_drawing = False
                         continue
 
-                # 2. Затваряне на учебник (Split view)
                 if globals().get("show_split_book"):
                     b_c_bk = globals().get("g_r_book_close")
                     if b_c_bk and b_c_bk.inflate(14, 14).collidepoint(curr_pos):
@@ -1587,14 +1759,12 @@ while True:
                         is_drawing = False
                         continue
 
-                # 3. Модал: Избор на учебник (Picker)
                 if globals().get("show_textbook_picker"):
                     b_c_tb = globals().get("g_btn_close_tb")
                     if b_c_tb and b_c_tb.inflate(14, 14).collidepoint(curr_pos):
                         globals()["show_textbook_picker"] = False
                         is_drawing = False
                         continue
-                    # Избор на конкретен файл от списъка
                     for r_file, fname in globals().get("g_tb_btn_rects", []):
                         if r_file.inflate(4, 4).collidepoint(curr_pos):
                             if callable(globals().get("open_textbook")):
@@ -1604,14 +1774,12 @@ while True:
                     is_drawing = False
                     continue
 
-                # 4. Модал: Избор на профил
                 if globals().get("show_user_modal"):
                     b_c_u = globals().get("g_btn_close_u_modal")
                     if b_c_u and b_c_u.inflate(14, 14).collidepoint(curr_pos):
                         globals()["show_user_modal"] = False
                         is_drawing = False
                         continue
-                    # Избор на профил от списъка
                     for u_rect, u_obj in globals().get("user_btn_rects", []):
                         if u_rect.collidepoint(curr_pos):
                             switch_user(u_obj)
@@ -1626,7 +1794,6 @@ while True:
                     is_drawing = False
                     continue
 
-                # 5. Модал: Нов ученик
                 if globals().get("show_new_user_modal"):
                     b_c_nu = globals().get("g_btn_close_nu")
                     if b_c_nu and b_c_nu.inflate(14, 14).collidepoint(curr_pos):
@@ -1647,7 +1814,6 @@ while True:
                     is_drawing = False
                     continue
 
-                # 6. Модал: PDF QR експорт
                 if globals().get("show_pdf_modal"):
                     b_c_m = globals().get("g_btn_close_modal")
                     if b_c_m and b_c_m.inflate(14, 14).collidepoint(curr_pos):
@@ -1655,13 +1821,11 @@ while True:
                         is_drawing = False
                         continue
 
-            # 1. ПРОВЕРКА ЗА КЛИК ВЪРХУ ПРОФИЛА В DOCK
             if event.button == 1 and r_user.inflate(6, 6).collidepoint(curr_pos):
                 show_user_modal = True
                 is_drawing = False
                 continue
 
-            # 2. ПРОВЕРКА ЗА КЛИК ВЪРХУ ЦВЕТОВЕТЕ В ГОРНАТА ЛЕНТА
             color_clicked = False
             if "color_rects" in globals() and event.button == 1:
                 for idx, c_rect in enumerate(color_rects):
@@ -1679,9 +1843,7 @@ while True:
                 is_drawing = False
                 continue
 
-            # 3. ПРОВЕРКА ЗА КЛИК ВЪРХУ КОШЧЕТО И СТРАНИЦИТЕ
             if event.button == 1:
-                # Кошче
                 g_clr = globals().get("g_r_clear")
                 if g_clr and g_clr.inflate(12, 12).collidepoint(curr_pos):
                     if callable(globals().get("clear_current_page")):
@@ -1691,7 +1853,13 @@ while True:
                     is_drawing = False
                     continue
 
-                # Предишна страница (‹)
+                g_del = globals().get("g_r_del")
+                if g_del and g_del.inflate(12, 12).collidepoint(curr_pos):
+                    if callable(globals().get("delete_current_page")):
+                        delete_current_page()
+                    is_drawing = False
+                    continue
+
                 g_prv = globals().get("g_r_prev")
                 if g_prv and g_prv.inflate(12, 12).collidepoint(curr_pos):
                     if callable(globals().get("prev_page")):
@@ -1699,7 +1867,6 @@ while True:
                     is_drawing = False
                     continue
 
-                # Следваща страница (›)
                 g_nxt = globals().get("g_r_next")
                 if g_nxt and g_nxt.inflate(12, 12).collidepoint(curr_pos):
                     if callable(globals().get("next_page")):
@@ -1707,7 +1874,6 @@ while True:
                     is_drawing = False
                     continue
 
-                # Нова страница (+)
                 g_ad = globals().get("g_r_add")
                 if g_ad and g_ad.inflate(12, 12).collidepoint(curr_pos):
                     if callable(globals().get("add_blank_page")):
@@ -1715,7 +1881,7 @@ while True:
                     is_drawing = False
                     continue
 
-                # 4. ОСНОВНИ ТАБОВЕ (Тетрадка, Учебник, PDF, Оформи, Gemini)
+                # Таб Тетрадка
                 g_t_notes = globals().get("g_r_tab_notes")
                 if g_t_notes and g_t_notes.inflate(10, 10).collidepoint(curr_pos):
                     if callable(globals().get("close_textbook")):
@@ -1727,6 +1893,7 @@ while True:
                     is_drawing = False
                     continue
 
+                # Таб Учебник
                 g_t_book = globals().get("g_r_tab_book")
                 if g_t_book and g_t_book.inflate(10, 10).collidepoint(curr_pos):
                     if globals().get("show_split_book"):
@@ -1741,12 +1908,15 @@ while True:
                     is_drawing = False
                     continue
 
+                # Таб PDF
                 g_t_pdf = globals().get("g_r_tab_pdf")
                 if g_t_pdf and g_t_pdf.inflate(10, 10).collidepoint(curr_pos):
-                    export_all_to_pdf_and_show_qr()
+                    if callable(globals().get("export_all_to_pdf_and_show_qr")):
+                        export_all_to_pdf_and_show_qr()
                     is_drawing = False
                     continue
 
+                # Таб Оформи
                 g_t_beau = globals().get("g_r_tab_beautify")
                 if g_t_beau and g_t_beau.inflate(10, 10).collidepoint(curr_pos):
                     if callable(globals().get("trigger_beautify_to_new_page")):
@@ -1754,6 +1924,7 @@ while True:
                     is_drawing = False
                     continue
 
+                # Таб Gemini
                 g_t_gem = globals().get("g_r_tab_gemini")
                 if g_t_gem and g_t_gem.inflate(10, 10).collidepoint(curr_pos):
                     if callable(globals().get("trigger_gemini_analysis")):
@@ -1761,17 +1932,12 @@ while True:
                     is_drawing = False
                     continue
 
-            # БУТОН 1 (Връхче): Писане
             if event.button == 1:
                 current_action = globals().get("active_tool", "pen")
                 is_drawing = True
-
-            # БУТОН 3 (Долен бутон на стилуса): Гумичка при задържане
             elif event.button == 3:
                 current_action = "eraser"
                 is_drawing = True
-
-            # БУТОН 2 (Горен бутон на стилуса): Местене / Pan при задържане
             elif event.button == 2:
                 current_action = "pan"
                 is_drawing = True
@@ -1781,10 +1947,8 @@ while True:
             curr_pos = event.pos
             mouse_x, mouse_y = curr_pos
 
-            # Проверяваме състоянието на бутоните в реално време (ляв, среден, десен)
             b_left, b_mid, b_right = pygame.mouse.get_pressed()
 
-            # АКТИВНО МЕСТЕНЕ (Горен бутон / Среден бутон натиснат)
             if b_mid or current_action == "pan":
                 if last_pos is not None:
                     dx = curr_pos[0] - last_pos[0]
@@ -1795,19 +1959,16 @@ while True:
                     offset_y = max(0, min(max_off_y, offset_y - dy))
                 last_pos = curr_pos
 
-            # АКТИВНО РИСУВАНЕ ИЛИ ТРИЕНЕ
             elif (b_left or b_right or is_drawing) and not b_mid and not globals().get('is_holding_pan', False) and current_action != 'pan' and last_pos is not None:
                 p1 = (last_pos[0] - book_w + offset_x, last_pos[1] + offset_y)
                 p2 = (curr_pos[0] - book_w + offset_x, curr_pos[1] + offset_y)
 
                 target_canvas = getattr(globals().get("page"), "canvas", None)
                 if target_canvas is not None:
-                    # ТРИЕНЕ (Долен бутон / Десен бутон)
                     if b_right or current_action == "eraser":
                         w = 32
                         pygame.draw.line(target_canvas, (0, 0, 0, 0), p1, p2, w)
                         pygame.draw.circle(target_canvas, (0, 0, 0, 0), p2, w // 2)
-                    # ПИСАНЕ (Връхче / Ляв бутон)
                     elif b_left or current_action == "pen":
                         c = globals().get("current_ink_color") or globals().get("current_color") or (20, 20, 20)
                         w = 3
@@ -1944,20 +2105,44 @@ while True:
     active_icon = get_crisp_icon(active_tab_name, (255, 255, 255, 255), size=20)
     screen.blit(active_icon, (bx - active_icon.get_width() // 2, bubble_cy - active_icon.get_height() // 2 - 1))
 
-    # 1. Профил
     u_h = r_user.collidepoint((mouse_x, mouse_y))
     u_col_rgba = (245, 245, 250, 255) if u_h else (140, 144, 156, 255)
     u_icon_surf = get_crisp_icon("user", u_col_rgba, size=18)
-    screen.blit(u_icon_surf, (r_user.x + 8, r_user.centery - u_icon_surf.get_height() // 2))
+    screen.blit(u_icon_surf, (r_user.x + 3, r_user.centery - u_icon_surf.get_height() // 2))
 
-    u_name_s = font_btn.render(current_user['name'], True, u_col_rgba[:3])
+    global _cached_user_id, _cached_name_surf, _cached_sub_surf
+    try:
+        _cached_user_id
+    except NameError:
+        _cached_user_id = None
+        _cached_name_surf = None
+        _cached_sub_surf = None
+
+    _cur_id = current_user.get('id') or current_user.get('name')
+    if _cached_user_id != _cur_id or _cached_name_surf is None:
+        _raw_name = str(current_user.get('name', 'Ученик')).strip()
+        _parts = _raw_name.split()
+        if len(_parts) >= 2:
+            _d_name = f"{_parts[0]} {_parts[1][0]}."
+        else:
+            _d_name = _raw_name
+
+        if font_btn.size(_d_name)[0] > 70:
+            while len(_d_name) > 3 and font_btn.size(_d_name + "..")[0] > 70:
+                _d_name = _d_name[:-1]
+            _d_name += ".."
+
+        _cached_name_surf = font_btn.render(_d_name, True, (245, 245, 250))
+        _cached_sub_surf = font_btn.render(current_user.get('grade', ''), True, (120, 125, 138))
+        _cached_user_id = _cur_id
+
+    u_name_s = _cached_name_surf
     u_sub_s  = font_btn.render(current_user.get('grade', ''), True, (120, 125, 138))
-    screen.blit(u_name_s, (r_user.x + 32, r_user.y + 6))
-    screen.blit(u_sub_s,  (r_user.x + 32, r_user.y + 22))
+    screen.blit(u_name_s, (r_user.x + 25, r_user.y + 6))
+    screen.blit(u_sub_s,  (r_user.x + 25, r_user.y + 22))
 
     pygame.draw.line(screen, C_NAV_BORDER, (bar_x + 112, bar_y + 14), (bar_x + 112, bar_y + bar_h - 14), 1)
 
-    # 2. 4 Цвята + Изчисти
     for idx, c_rect in enumerate(color_rects):
         col = AVAILABLE_COLORS[idx][1]
         is_sel = (current_ink_color == col and effective_tool == "pen")
@@ -1978,8 +2163,7 @@ while True:
 
     pygame.draw.line(screen, C_NAV_BORDER, (sep1_x, bar_y + 14), (sep1_x, bar_y + bar_h - 14), 1)
 
-    # 3. Страници
-    for br, txt in [(r_prev, "‹"), (r_next, "›"), (r_add, "+")]:
+    for br, txt in [(r_del, "-"), (r_prev, "‹"), (r_next, "›"), (r_add, "+")]:
         bh = br.collidepoint((mouse_x, mouse_y))
         ts = font_head.render(txt, True, C_TEXT_LIGHT if bh else C_ICON_MUTED)
         screen.blit(ts, (br.centerx - ts.get_width() // 2, br.centery - ts.get_height() // 2))
@@ -1990,7 +2174,6 @@ while True:
 
     pygame.draw.line(screen, C_NAV_BORDER, (sep2_x, bar_y + 14), (sep2_x, bar_y + bar_h - 14), 1)
 
-    # 4. Основни табове
     tabs_data = [
         (r_tab_notes, "notes", "Тетрадка"),
         (r_tab_book, "book", "Учебник"),
@@ -2020,10 +2203,10 @@ while True:
         pygame.draw.rect(screen, (15, 23, 42), tr, border_radius=16)
         screen.blit(t_surf, (tr.centerx - t_surf.get_width() // 2, tr.centery - t_surf.get_height() // 2 - 3))
     elif is_beautifying:
-        b_w, b_h = 280, 32
+        b_w, b_h = 300, 32
         b_rect = pygame.Rect(sw // 2 - b_w // 2, bar_y + bar_h + 12, b_w, b_h)
         pygame.draw.rect(screen, (15, 23, 42), b_rect, border_radius=16)
-        c_txt = font_pill.render("✨ Подреждане на нова страница...", True, (255, 255, 255))
+        c_txt = font_pill.render("✨ Оформяне и надграждане...", True, (255, 255, 255))
         screen.blit(c_txt, (b_rect.centerx - c_txt.get_width() // 2, b_rect.centery - c_txt.get_height() // 2))
 
     # ----------------- GEMINI DRAWER -----------------
@@ -2103,9 +2286,7 @@ while True:
 
     # ----------------- MODAL: UCHEBNIK -----------------
     if show_textbook_picker:
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((15, 23, 42, 140))
-        screen.blit(overlay, (0, 0))
+        screen.blit(STATIC_OVERLAY, (0, 0))
 
         card_surf, pad = get_crisp_modal_card(tb_rect.w, tb_rect.h, radius=20)
         screen.blit(card_surf, (tb_rect.x - pad, tb_rect.y - pad))
@@ -2135,9 +2316,7 @@ while True:
 
     # ----------------- MODAL: PROFILI -----------------
     if show_user_modal:
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((15, 23, 42, 140))
-        screen.blit(overlay, (0, 0))
+        screen.blit(STATIC_OVERLAY, (0, 0))
 
         card_surf, pad = get_crisp_modal_card(u_modal_rect.w, u_modal_rect.h, radius=20)
         screen.blit(card_surf, (u_modal_rect.x - pad, u_modal_rect.y - pad))
@@ -2179,9 +2358,7 @@ while True:
 
     # ----------------- MODAL: NOV UCHENIK -----------------
     if show_new_user_modal:
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((15, 23, 42, 140))
-        screen.blit(overlay, (0, 0))
+        screen.blit(STATIC_OVERLAY, (0, 0))
 
         card_surf, pad = get_crisp_modal_card(nu_rect.w, nu_rect.h, radius=20)
         screen.blit(card_surf, (nu_rect.x - pad, nu_rect.y - pad))
@@ -2223,14 +2400,12 @@ while True:
 
     # ----------------- MODAL: PDF & QR -----------------
     if show_pdf_modal:
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((15, 23, 42, 140))
-        screen.blit(overlay, (0, 0))
+        screen.blit(STATIC_OVERLAY, (0, 0))
 
         card_surf, pad = get_crisp_modal_card(modal_rect.w, modal_rect.h, radius=20)
         screen.blit(card_surf, (modal_rect.x - pad, modal_rect.y - pad))
 
-        m_title = font_head.render("Свали записките като PDF", True, (15, 23, 42))
+        m_title = font_head.render("Свали като PDF", True, (15, 23, 42))
         screen.blit(m_title, (modal_x + 24, modal_y + 20))
 
         cl_hover = btn_close_modal.collidepoint((mouse_x, mouse_y))
@@ -2238,22 +2413,26 @@ while True:
         cl_txt = font_btn.render("✕", True, (15, 23, 42) if cl_hover else (100, 116, 139))
         screen.blit(cl_txt, (btn_close_modal.centerx - cl_txt.get_width() // 2, btn_close_modal.centery - cl_txt.get_height() // 2))
 
+        pygame.draw.line(screen, (226, 232, 240), (modal_x + 24, modal_y + 58), (modal_x + modal_w - 24, modal_y + 58), 1)
+
         if pdf_qr_surf:
-            qr_rect = pdf_qr_surf.get_rect(center=(modal_rect.centerx, modal_y + 180))
-            pygame.draw.rect(screen, (241, 245, 249), qr_rect.inflate(14, 14), border_radius=12)
+            qr_rect = pdf_qr_surf.get_rect(center=(modal_rect.centerx, modal_y + 175))
+            card_box = qr_rect.inflate(16, 16)
+            pygame.draw.rect(screen, (248, 250, 252), card_box, border_radius=12)
+            pygame.draw.rect(screen, (226, 232, 240), card_box, 1, border_radius=12)
             screen.blit(pdf_qr_surf, qr_rect)
         else:
-            no_qr_txt = font_modal.render("Инсталирайте: pip install qrcode", True, (220, 38, 38))
+            no_qr_txt = font_modal.render("Генериране на QR код...", True, (100, 116, 139))
             screen.blit(no_qr_txt, (modal_rect.centerx - no_qr_txt.get_width() // 2, modal_y + 160))
 
-        info1 = font_pill.render("Сканирайте с телефона в същата Wi-Fi мрежа:", True, (100, 116, 139))
-        screen.blit(info1, (modal_rect.centerx - info1.get_width() // 2, modal_y + 325))
+        info1 = font_pill.render("Сканирайте с телефон в същата мрежа:", True, (100, 116, 139))
+        screen.blit(info1, (modal_rect.centerx - info1.get_width() // 2, modal_y + 305))
 
-        link_bg_r = pygame.Rect(modal_x + 24, modal_y + 355, modal_w - 48, 36)
+        link_bg_r = pygame.Rect(modal_x + 24, modal_y + 335, modal_w - 48, 38)
         pygame.draw.rect(screen, (248, 250, 252), link_bg_r, border_radius=8)
         pygame.draw.rect(screen, (226, 232, 240), link_bg_r, 1, border_radius=8)
 
-        link_s = font_pill.render(pdf_download_url, True, C_BLUE_ACCENT)
+        link_s = font_modal.render(pdf_download_url, True, C_BLUE_ACCENT)
         screen.blit(link_s, (link_bg_r.centerx - link_s.get_width() // 2, link_bg_r.centery - link_s.get_height() // 2))
 
     # ----------------- КУРСОР -----------------
@@ -2264,7 +2443,6 @@ while True:
                   (show_split_book and mouse_x < book_w) or
                   show_pdf_modal or show_user_modal or show_new_user_modal or show_textbook_picker)
 
-    # Използваме реалната позиция от Wacom стилуса
     cx, cy = current_cursor_pos if ("current_cursor_pos" in globals() and current_cursor_pos) else (mouse_x, mouse_y)
 
     if is_over_ui:
