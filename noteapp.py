@@ -711,6 +711,7 @@ drawer_scroll_y = 0
 drawer_max_scroll = 0
 drawer_is_dragging = False
 drawer_drag_start_y = 0
+drawer_drag_start_scroll = 0
 is_analyzing = False
 ai_analysis_text = ""
 
@@ -825,7 +826,6 @@ def get_textbook_files():
         return []
     all_pdfs = [f for f in os.listdir(TEXTBOOKS_DIR) if f.lower().endswith(".pdf")]
 
-    # Взимаме класа на текущия ученик
     u_grade = ""
     if "current_user" in globals() and isinstance(current_user, dict):
         u_grade = str(current_user.get("grade", "")).strip().upper()
@@ -833,10 +833,8 @@ def get_textbook_files():
     meta_path = os.path.join(TEXTBOOKS_DIR, "metadata.json")
     if os.path.exists(meta_path) and u_grade:
         try:
-            import json
             with open(meta_path, "r", encoding="utf-8") as mf:
                 meta = json.load(mf)
-            # Филтрираме само тези, които съвпадат по клас
             filtered = [f for f in all_pdfs if meta.get(f, {}).get("grade", "").strip().upper() == u_grade]
             return sorted(filtered)
         except Exception:
@@ -1133,13 +1131,7 @@ def trigger_beautify_to_new_page():
                     for item in sec.get("items", []):
                         existing_ctx += f" - {item.get('text', '')}\n"
 
-            print('[DEBUG BEAUTIFY] Дължина на existing_ctx:', len(existing_ctx))
-            if existing_ctx:
-                print('[DEBUG BEAUTIFY] Контекст:', repr(existing_ctx[:120]))
-            else:
-                print('[DEBUG BEAUTIFY] ВНИМАНИЕ: Няма подаден съществуващ контекст!')
             sections = call_gemini_beautify_page(img_bytes, existing_context=existing_ctx)
-            print('[DEBUG BEAUTIFY] Върнати секции:', len(sections) if sections else 0)
 
             if sections and isinstance(sections, list):
                 push_undo()
@@ -1194,7 +1186,6 @@ def trigger_beautify_to_new_page():
                 target_p.has_unprocessed_ink = False
                 target_p.ink_bounds = [CANVAS_W, CANVAS_H, 0, 0]
                 save_current_page()
-                print(f"[BEAUTIFY] Готово! Натрупани {len(target_p.formatted_items)} секции.")
         except Exception as e:
             print(f"[Beautify error]: {e}")
             show_toast(f"Грешка: {e}")
@@ -1469,7 +1460,6 @@ def open_classroom():
             ""
         )
 
-        # Ако имейлът все още е празен, опитваме да го намерим от глобалните променливи
         if not user_email:
             for k in ["current_email", "student_email", "STUDENT_EMAIL"]:
                 if k in globals() and globals()[k]:
@@ -1509,7 +1499,6 @@ start_app_time = time.time()
 
 _last_session_check = 0
 while True:
-    # Автоматично засичане на нова карта от уеб дашборда
     if time.time() - _last_session_check > 0.4:
         _last_session_check = time.time()
         try:
@@ -1518,13 +1507,10 @@ while True:
                 with open(_sess_file, "r", encoding="utf-8") as _sf:
                     _remote_id = _sf.read().strip()
                 if _remote_id and "current_user" in globals() and current_user.get("id") != _remote_id:
-                    # Търсим съвпадащ потребител или зареждаме от users.json
                     all_users = load_users()
                     target_u = next((u for u in all_users if u.get("id") == _remote_id), None)
                     if not target_u:
-                        # Ако не съществува в users.json, взимаме данните от current_session.json
                         if os.path.exists("/home/bobo/current_session.json"):
-                            import json
                             with open("/home/bobo/current_session.json", "r", encoding="utf-8") as _csf:
                                 _cdata = json.load(_csf)
                             target_u = {
@@ -1537,7 +1523,7 @@ while True:
                             save_users(all_users)
                     if target_u:
                         switch_user(target_u)
-        except Exception as _e:
+        except Exception:
             pass
 
     if globals().get("is_in_classroom", False):
@@ -1687,7 +1673,6 @@ while True:
             sys.exit()
 
         elif event.type == EVENT_BTN_NOTES:
-            print("[BTN] Бутон 1: Връщане към активна тетрадка")
             if show_split_book:
                 close_textbook()
             if show_ai_drawer:
@@ -1697,7 +1682,6 @@ while True:
         elif event.type == EVENT_BTN_CLASSROOM:
             pass
         elif event.type == EVENT_BTN_BOOK:
-            print("[BTN] Учебници")
             if show_split_book:
                 close_textbook()
             else:
@@ -1708,7 +1692,6 @@ while True:
                     show_textbook_picker = True
 
         elif event.type == EVENT_BTN_AI:
-            print("[BTN] Gemini AI")
             trigger_gemini_analysis()
 
         elif event.type == pygame.VIDEORESIZE:
@@ -1748,6 +1731,13 @@ while True:
                         continue
                     if curr_pos[0] >= screen.get_width() - 50 and curr_pos[1] <= 55:
                         globals()["show_ai_drawer"] = False
+                        is_drawing = False
+                        continue
+                    # Докосване с писалка/пръст вътре в AI чекмеджето за скролване
+                    if curr_pos[0] >= sw - drawer_width:
+                        drawer_is_dragging = True
+                        drawer_drag_start_y = curr_pos[1]
+                        drawer_drag_start_scroll = drawer_scroll_y
                         is_drawing = False
                         continue
 
@@ -1946,6 +1936,13 @@ while True:
             current_cursor_pos = event.pos
             curr_pos = event.pos
             mouse_x, mouse_y = curr_pos
+
+            # Превъртане на AI панела с писалката при влачене
+            if drawer_is_dragging:
+                dy = curr_pos[1] - drawer_drag_start_y
+                drawer_scroll_y = max(0, min(drawer_max_scroll, drawer_drag_start_scroll - dy))
+                last_pos = curr_pos
+                continue
 
             b_left, b_mid, b_right = pygame.mouse.get_pressed()
 
